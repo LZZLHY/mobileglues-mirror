@@ -3,13 +3,20 @@
 # 该文件不会被主仓 GitHub Actions 调起 —— 它是给 LZZLHY/<dep>-mirror 仓的
 # .github/workflows/sync-upstream.yml 用的模板。详见 docs/guides/third-party-deps-restructure-plan.md §3.5.2
 #
-# 部署方式：见 scripts/deploy-mirror-repos.sh
+# 部署方式：见 scripts/deploy-mirror-repos.sh / .tmp_deploy_mirrors.ps1
 #
 # 强约束：永远 fast-forward，不用 --force / --force-with-lease（避免上游
 # force-push 把 deps.lock 已 pin 的旧 commit 覆盖掉）。
 #
 # 使用：在 sync-upstream.yml 顶部用 https://github.com/MobileGL-Dev/MobileGlues.git placeholder，
-# deploy-mirror-repos.sh 会按 mirror 名替换。
+# deploy 脚本会按 mirror 名替换。
+#
+# Token 选择：
+#   • 默认 secrets.GITHUB_TOKEN 不能 push 含 .github/workflows/*.yml 的上游分支
+#     （GitHub 会拒绝："refusing to allow a GitHub App to create or update workflow"）
+#   • 解决：在 mirror 仓 Settings → Secrets 添加 MIRROR_PUSH_TOKEN
+#           （PAT，scope 包含 'repo' + 'workflow'）。本 workflow 优先用它，否则
+#           回退到 GITHUB_TOKEN。回退路径会跳过含 workflow 文件的上游分支。
 
 name: sync-upstream
 
@@ -20,16 +27,20 @@ on:
 
 permissions:
   contents: write
+  actions: write
   issues: write
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 用 PAT 才能 push 含 workflow yaml 的上游分支
+          token: ${{ secrets.MIRROR_PUSH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |
@@ -39,19 +50,46 @@ jobs:
       - name: Sync from upstream (preserve history on force-push)
         id: sync
         run: |
-          git remote add upstream https://github.com/MobileGL-Dev/MobileGlues.git 2>/dev/null || git remote set-url upstream https://github.com/MobileGL-Dev/MobileGlues.git
+          set +e
+          git remote add upstream https://github.com/MobileGL-Dev/MobileGlues.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/MobileGL-Dev/MobileGlues.git
           git fetch upstream --tags --prune
-
-          # 关键：永远 fast-forward。上游 force-push 时本步会失败 → 报警 step。
-          # deps.lock pin 的旧 commit 永远拉得到。
-          if ! git push origin "refs/remotes/upstream/*:refs/heads/upstream-*"; then
-            echo "::error::push refs failed (upstream may have force-pushed)"
-            echo "force_push=true" >> "$GITHUB_OUTPUT"
+          fetch_status=$?
+          if [ $fetch_status -ne 0 ]; then
+            echo "::error::fetch from upstream failed"
             exit 1
           fi
 
-          if ! git push origin --tags; then
-            echo "::warning::push tags failed (upstream may have re-tagged)"
+          # 关键：永远 fast-forward。上游 force-push 时本步会失败 → 报警 step。
+          # deps.lock pin 的旧 commit 永远拉得到。
+          push_out=$(git push origin "refs/remotes/upstream/*:refs/heads/upstream-*" 2>&1)
+          push_status=$?
+          echo "$push_out"
+
+          if [ $push_status -ne 0 ]; then
+            # 区分两种失败：
+            #   1. 'refusing to allow a GitHub App to create or update workflow' →
+            #      MIRROR_PUSH_TOKEN 没设；非致命，跳过含 workflow 的分支
+            #   2. 其他原因（force-push / 网络）→ 致命
+            if echo "$push_out" | grep -q "refusing to allow.*workflow"; then
+              echo "::warning::Some branches contain .github/workflows/* and were"
+              echo "            rejected because MIRROR_PUSH_TOKEN is not set."
+              echo "            Set MIRROR_PUSH_TOKEN (PAT with 'workflow' scope) to mirror those branches."
+              echo "            Other branches were synced successfully."
+              # 不算 force-push，把已能推的分支视为成功
+            else
+              echo "::error::push refs failed"
+              echo "force_push=true" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+          fi
+
+          # tags 同理；非致命失败容忍
+          tag_out=$(git push origin --tags 2>&1)
+          tag_status=$?
+          echo "$tag_out"
+          if [ $tag_status -ne 0 ]; then
+            echo "::warning::push tags returned non-zero (some tags may exist with same name in mirror)"
           fi
 
       - name: Open issue on force-push detection
